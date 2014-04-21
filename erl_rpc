@@ -1,0 +1,137 @@
+#!/usr/bin/env escript
+%% -*- erlang -*-
+%% vim: set ts=4 sts=4 sw=4 et:
+
+%% (c) 2014, Yuri Lukyanov
+%% License: MIT
+%%
+%% DOCUMENTATION
+%%
+%% module: erl_rpc
+%% short_description: Makes Erlang RPC to a remote node
+%% description:
+%%     - Makes Erlang RPC (remote procedure call) to a remote node. This module has a dependency on Erlang.
+%% options:
+%%   node:
+%%     description:
+%%       - an Erlang node to make RPC to
+%%     required: true
+%%     default: null
+%%   module:
+%%     description:
+%%       - a module name
+%%     required: true
+%%     default: null
+%%   function:
+%%     description:
+%%       - a function to call
+%%     required: true
+%%     default: null
+%%   args:
+%%     description:
+%%       - arguments of the calling function. See EXAMPLES.
+%%     required: false
+%%     default: null
+%%   cookie:
+%%     description:
+%%       - an Erlang cookie to use when calling a node
+%%     required: false
+%%     default: <default Erlang cookie>
+%% 
+%% EXAMPLES
+%% 
+%% - local_action: erl_rpc
+%%     node=node@localhost
+%%     module=my_module1
+%%     function=my_function1
+%%     args='atom, "string", 123, [list], {tuple}'
+%% 
+%% This is equal to executing the following code on a remote node:
+%%   my_module1:my_function1(atom, "string", 123, [list], {tuple}).
+%% 
+%% How to use with inventory:
+%% 
+%% - hosts: webservers
+%%   tasks:
+%%     - local_action: erl_rpc
+%%         node=nodename@{{ inventory_hostname }}
+%%         module=m1
+%%         function=f1
+%% 
+
+-compile([nowarn_unused_function]).
+
+main(["args"]) ->
+    fail("No arguments specified");
+
+main(["args" | ArgsRaw]) ->
+    Args = parse_args(ArgsRaw, []),
+    Res = rpc_call(Args),
+    EscapedMsg = json_escape(lists:flatten(io_lib:format("~p", [Res]))),
+    io:format("{ \"changed\": true, \"msg\": \"" ++ EscapedMsg ++ "\" }~n");
+
+main([ArgsFile]) ->
+    {ok, ArgsRaw} = file:read_file(ArgsFile),
+    % We do not want to parse shell-based arguments manually,
+    % so we just re-run self to make OS do that for us.
+    Output = os:cmd("/usr/bin/env escript " ++ ?FILE ++ " args " ++
+        binary_to_list(ArgsRaw)),
+    io:format("~s", [Output]).
+
+
+parse_args([], Acc) -> Acc;
+
+parse_args(["module=" ++ Module | RestArgs], Acc) ->
+    parse_args(RestArgs, [{module, list_to_atom(Module)} | Acc]);
+
+parse_args(["function=" ++ Fun | RestArgs], Acc) ->
+    parse_args(RestArgs, [{function, list_to_atom(Fun)} | Acc]);
+
+parse_args(["args=" ++ Args | RestArgs], Acc) ->
+    {ok, Tokens, _} = erl_scan:string("[" ++ Args ++ "]."),
+    {ok, ParsedArgs} = erl_parse:parse_term(Tokens),
+    parse_args(RestArgs, [{args, ParsedArgs} | Acc]);
+
+parse_args(["timeout=infinity" | RestArgs], Acc) ->
+    parse_args(RestArgs, [{timeout, infinity} | Acc]);
+
+parse_args(["timeout=" ++ Timeout | RestArgs], Acc) ->
+    parse_args(RestArgs, [{timeout, list_to_integer(Timeout)} | Acc]);
+
+parse_args(["cookie=" ++ Cookie | RestArgs], Acc) ->
+    parse_args(RestArgs, [{cookie, list_to_atom(Cookie)} | Acc]);
+
+parse_args(["node=" ++ Node | RestArgs], Acc) ->
+    parse_args(RestArgs, [{node, list_to_atom(Node)} | Acc]);
+
+parse_args([_ | RestArgs], Acc) ->
+    parse_args(RestArgs, Acc).
+
+
+rpc_call(Args) ->
+    Node    = proplists:get_value(node, Args),
+    Module  = proplists:get_value(module, Args),
+    Fun     = proplists:get_value(function, Args),
+    FunArgs = proplists:get_value(args, Args, []),
+    Timeout = proplists:get_value(timeout, Args, 5000),
+
+    CurrentNode = list_to_atom("ansible-erl-rpc-module-" ++ os:getpid()),
+    net_kernel:start([CurrentNode, shortnames]),
+    case proplists:get_value(cookie, Args) of
+        undefined -> nop;
+        Cookie -> erlang:set_cookie(node(), Cookie)
+    end,
+    case rpc:call(Node, Module, Fun, FunArgs, Timeout) of
+        {badrpc, Err} ->
+            fail(lists:flatten(io_lib:format("~p", [Err])));
+        _ -> ok
+    end.
+
+json_escape(Str) ->
+    % We keep it simple, no need for real escaping for now
+    re:replace(Str, "\"", "\\\\\"", [global, multiline, {return, list}]).
+
+fail(Msg) ->
+    EscapedMsg = json_escape(Msg),
+    io:format("{ \"failed\": true, \"msg\": \"" ++ EscapedMsg ++ "\" }~n"),
+    halt(1).
